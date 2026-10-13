@@ -193,9 +193,20 @@ def evaluate(evidence, state, model, repo):
     prompt = RUBRIC + '\nKnown units: ' + json.dumps(state['units']) + '\nExisting ratings: ' + json.dumps(state['ratings']) + '\nRepository: ' + str(repo) + '\nEvidence: ' + json.dumps(evidence)
     with tempfile.TemporaryDirectory(prefix='shoulder-review-') as folder:
         output = Path(folder) / 'result.json'
+        schema = Path(folder) / 'schema.json'
+        properties = {
+            'unit': {'type': 'string'}, 'score': {'type': 'integer', 'minimum': 1, 'maximum': 5},
+            'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
+            'evidence_ids': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1},
+            'reason': {'type': 'string'}, 'gaps': {'type': 'array', 'items': {'type': 'string'}}}
+        schema.write_text(json.dumps({'type': 'object', 'additionalProperties': False,
+                                      'required': ['ratings'], 'properties': {'ratings': {
+                                          'type': 'array', 'items': {'type': 'object',
+                                              'additionalProperties': False,
+                                              'required': list(properties), 'properties': properties}}}}))
         subprocess.run(['codex', 'exec', '--ephemeral', '--skip-git-repo-check',
                         '--ignore-user-config', '--sandbox', 'read-only', '-m', model, '-c', 'model_reasoning_effort="low"',
-                        '-c', 'mcp_servers={}', '--output-last-message', str(output), '-'],
+                        '-c', 'mcp_servers={}', '--output-schema', str(schema), '--output-last-message', str(output), '-'],
                        input=prompt, text=True, cwd=repo, check=True, timeout=180,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return json.loads(output.read_text())
@@ -228,11 +239,91 @@ def apply(state, result, evidence):
                                               for ref in rating['evidence_ids']]}
 
 
+def interview_questions(repo, unit):
+    paths = subprocess.check_output(['git', '-C', str(repo), 'ls-files', '-z', '--', unit],
+                                    timeout=5).decode().split('\0')
+    suffixes = {'.py', '.go', '.js', '.ts', '.tsx', '.rs', '.java', '.cs'}
+    for name in sorted(paths)[:1500]:
+        file = (repo / name).resolve()
+        if (any(part in {'tests', 'test', '__tests__', 'generated'} for part in Path(name).parts)
+                or file.name.startswith('test_') or file.name.endswith('_test.go')
+                or '.test.' in file.name or '.spec.' in file.name):
+            continue
+        if not file.is_relative_to((repo / unit).resolve()) or file.suffix not in suffixes or not file.is_file():
+            continue
+        if file.stat().st_size > 100000:
+            continue
+        lines = file.read_text(errors='replace').splitlines()
+        anchor = next((i for i, line in enumerate(lines[:200], 1) if line.strip()), None)
+        if anchor:
+            location = f'{name}:{anchor}'
+            return [{'id': key, 'question': question, 'source': name, 'line': anchor}
+                    for key, question in (
+                        ('flow', f'Using {location}, trace one input through this component to its output. Cite the functions you follow.'),
+                        ('boundaries', f'Using {location}, identify its caller or dependency boundary and explain what validates inputs there.'),
+                        ('failure', f'Using {location}, explain one reachable failure, how it is handled, and how you would diagnose it.'))]
+    raise ValueError('No bounded tracked production source found for this unit; no assessment performed')
+
+
+def interview_answers(file, repo, folder, questions):
+    file = file.expanduser().resolve()
+    if file.is_relative_to(repo) or file.is_relative_to(Path(__file__).resolve().parents[1]):
+        raise ValueError('Answers must be outside the checkout and installed skill')
+    try:
+        if identity(file.parent) == identity(repo):
+            raise ValueError('Answers must be outside every worktree of this repository')
+    except subprocess.SubprocessError:
+        pass
+    if file.stat().st_size > 40000:
+        raise ValueError('Answers file exceeds 40000 bytes')
+    document = json.loads(file.read_text())
+    rows = document.get('answers') if isinstance(document, dict) else None
+    known = {q['id']: q for q in questions}
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 3:
+        raise ValueError('Provide one to three answers')
+    evidence, seen = [], set()
+    for row in rows:
+        if (not isinstance(row, dict) or not isinstance(row.get('id'), str) or row['id'] not in known
+                or row['id'] in seen or not isinstance(row.get('answer'), str)
+                or not row['answer'].strip() or len(row['answer']) > 12000):
+            raise ValueError('Invalid, empty or duplicate interview answer')
+        seen.add(row['id'])
+        evidence.append({'id': f'e{len(evidence)+1}', 'question': known[row['id']], 'text': row['answer']})
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.NamedTemporaryFile(mode='w', dir=folder, prefix='interview-', suffix='.jsonl', delete=False) as output:
+        os.chmod(output.name, 0o600)
+        for index, item in enumerate(evidence, 1):
+            item.update(source=output.name, line=index)
+            output.write(json.dumps(item) + '\n')
+    return evidence
+
+
+def assess_interview(state, unit, evidence, model, repo):
+    old = state['ratings'].get(unit, {})
+    scoped = {'units': {unit: state['units'][unit]}, 'ratings': {unit: old} if old else {}}
+    result = evaluate(evidence, scoped, model, repo)
+    apply(scoped, result, evidence)
+    expert_proposed = any(rating['score'] == 5 for rating in result['ratings'])
+    if expert_proposed:
+        scoped['ratings'] = {unit: old} if old else {}
+    updated = scoped['ratings'].get(unit, {})
+    persisted = updated != old
+    if persisted:
+        state['ratings'][unit] = updated
+    return {'unit': unit, 'persisted': persisted, 'unassessed': not bool(updated.get('score')),
+            'self_rating_protected': old.get('source') == 'self',
+            'level_increased': persisted and updated['score'] > old.get('score', 0),
+            'rating': updated or None,
+            'assessment_note': ('A single interview cannot establish the repeated reasoning and breadth required for level 5.'
+                                if expert_proposed else None)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['init', 'status', 'rate', 'review'])
+    parser.add_argument('command', choices=['init', 'status', 'rate', 'review', 'calibrate'])
     parser.add_argument('--repo', required=True, type=Path)
     parser.add_argument('--unit')
+    parser.add_argument('--answers-file', type=Path)
     parser.add_argument('--score', type=int, choices=range(1, 6))
     parser.add_argument('--timezone', default='UTC')
     parser.add_argument('--model', default='gpt-6.1-sol')
@@ -254,6 +345,36 @@ def main():
         if args.command == 'init':
             state['units'] = units(repo)
             save(path, state)
+        elif args.command == 'calibrate':
+            if not args.unit:
+                parser.error('calibrate requires --unit')
+            discovered = units(repo)
+            if args.unit not in discovered:
+                parser.error('Unknown unit; use init or status to list units')
+            state['units'][args.unit] = discovered[args.unit]
+            interview = path.parent / 'interview.json'
+            try:
+                if args.answers_file:
+                    if not interview.exists():
+                        raise ValueError('Prepare calibration questions before submitting answers')
+                    prepared = json.loads(interview.read_text())
+                    if prepared.get('unit') != args.unit:
+                        raise ValueError('Prepared interview belongs to another unit')
+                    evidence = interview_answers(args.answers_file, repo, path.parent, prepared['questions'])
+                    result = assess_interview(state, args.unit, evidence, args.model, repo)
+                    if result['persisted']:
+                        save(path, state)
+                    print(json.dumps(result, indent=2))
+                else:
+                    prepared = {'unit': args.unit, 'questions': interview_questions(repo, args.unit),
+                                'persisted': False, 'unassessed': not bool(state['ratings'].get(args.unit, {}).get('score')),
+                                'self_rating_protected':
+                                state['ratings'].get(args.unit, {}).get('source') == 'self'}
+                    save(interview, prepared)
+                    print(json.dumps(prepared, indent=2))
+            except (ValueError, OSError, subprocess.SubprocessError) as error:
+                raise SystemExit(f'Calibration failed: {error}')
+            return
         elif args.command == 'rate':
             if args.unit not in state['units'] or args.score is None:
                 parser.error('rate requires an initialized --unit and --score 1..5')
