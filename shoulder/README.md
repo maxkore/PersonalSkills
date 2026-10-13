@@ -57,6 +57,20 @@ You can supply a self-rating, or ask the assistant for a brief calibration conve
 
 Your self-ratings stay protected until you change them. Automatic inference cannot overwrite them or lower an existing level. Levels describe familiarity, not authority: approval requirements, testing, and verification still apply.
 
+## Optional calibration interview
+
+Start with `python3 shoulder/scripts/shoulder.py calibrate --repo /path/to/repo --unit apps/widget`. Use `--unit .` when discovery falls back to the root. The helper prepares three questions from one tracked production source file about flow, boundaries and a failure case. It inspects at most 1,500 tracked paths and anchors within the first 200 lines of a source file no larger than 100 KB. Test and generated directories are skipped. The selected file gives a narrow starting point; the interview does not establish expertise across the whole component. The assistant asks one question at a time in chat. Preparing questions does not assign a rating; a repository without suitable tracked code receives no assessment and keeps any existing rating.
+
+The assistant records your own answers privately outside the checkout, or you provide an external JSON file:
+
+```json
+{"answers":[{"id":"flow","answer":"Your explanation"},{"id":"boundaries","answer":"Your explanation"},{"id":"failure","answer":"Your explanation"}]}
+```
+
+Submit one to three answers with `python3 shoulder/scripts/shoulder.py calibrate --repo /path/to/repo --unit apps/widget --answers-file /private/path/answers.json`. Keep the file private (0600). No interactive terminal prompt is required. This phase requires authenticated Codex and sends the selected answers for read-only verification against the repository. Private snapshots retain question context and exact answer file/line evidence. Assessment is limited to the selected component; other ratings remain unchanged.
+
+The result explicitly reports whether an inferred assessment was `persisted`, remains `unassessed`, or a `self_rating_protected` prevented updates. `level_increased` is false when an assessment keeps the same level. Weak or unverifiable evidence does not update ratings, and self-ratings remain protected. A short interview cannot establish repeated reasoning required for level 5.
+
 ## Human trust and pushback during coding
 
 At a lower level, the assistant investigates assumptions independently and explains concerns in context. At a higher level, it gives more weight to your demonstrated domain judgment and asks whether a conflict reflects missing context. It should still challenge verified defects at every level.
